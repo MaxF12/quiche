@@ -3593,7 +3593,7 @@ impl<F: BufFactory> Connection<F> {
                         stream_id,
                         offset,
                         length,
-                        ..
+                        fin,
                     } => {
                         // Emit qlog before checking if the stream still exists.
                         // The client does need to ACK frames that were received
@@ -3624,6 +3624,10 @@ impl<F: BufFactory> Connection<F> {
                         };
 
                         let dropped = stream.send.ack_and_drop(offset, length);
+                        if fin {
+                            stream.send.ack_fin(offset + length as u64);
+                        }
+
                         let priority_key = Arc::clone(&stream.priority_key);
 
                         // Only collect the stream if it is complete and not

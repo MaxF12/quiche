@@ -5383,6 +5383,148 @@ fn stream_zero_length_fin(
 }
 
 #[rstest]
+fn stream_zero_length_fin_retransmission(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+    #[values(false, true)] ack_original_fin_after_retransmit: bool,
+) {
+    fn ack_client_packet(
+        pipe: &mut test_utils::Pipe, packet_num: u64, buf: &mut [u8],
+    ) {
+        let mut ranges = ranges::RangeSet::default();
+        ranges.insert(packet_num..packet_num + 1);
+
+        let frames = [frame::Frame::ACK {
+            ack_delay: 0,
+            ranges,
+            ecn_counts: None,
+        }];
+
+        let written =
+            test_utils::encode_pkt(&mut pipe.server, Type::Short, &frames, buf)
+                .unwrap();
+
+        assert_eq!(pipe.client_recv(&mut buf[..written]), Ok(written));
+    }
+
+    fn assert_stream_frame(
+        receiver: &mut Connection, packet: &[u8], stream_id: u64, offset: u64,
+        data: &[u8], fin: bool,
+    ) {
+        let mut packet = packet.to_vec();
+        let frames = test_utils::decode_pkt(receiver, &mut packet).unwrap();
+
+        assert!(frames.iter().any(|frame| match frame {
+            frame::Frame::Stream {
+                stream_id: frame_stream_id,
+                data: frame_data,
+            } =>
+                *frame_stream_id == stream_id &&
+                    frame_data.off() == offset &&
+                    frame_data.as_ref() == data &&
+                    frame_data.fin() == fin,
+
+            _ => false,
+        }));
+    }
+
+    let mut pipe = test_utils::Pipe::new(cc_algorithm_name).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+    assert_eq!(pipe.advance(), Ok(()));
+
+    let stream_id = 2;
+    let body = b"body";
+
+    assert_eq!(
+        pipe.client.stream_send(stream_id, body, false),
+        Ok(body.len())
+    );
+
+    let body_packet_num = pipe.client.next_pkt_num;
+    let mut body_packet = [0; 65535];
+    let (body_packet_len, _) = pipe.client.send(&mut body_packet).unwrap();
+
+    assert_stream_frame(
+        &mut pipe.server,
+        &body_packet[..body_packet_len],
+        stream_id,
+        0,
+        body,
+        false,
+    );
+
+    assert_eq!(
+        pipe.server_recv(&mut body_packet[..body_packet_len]),
+        Ok(body_packet_len)
+    );
+
+    assert_eq!(pipe.client.stream_send(stream_id, b"", true), Ok(0));
+
+    let fin_packet_num = pipe.client.next_pkt_num;
+    let mut fin_packet = [0; 65535];
+    let (fin_packet_len, _) = pipe.client.send(&mut fin_packet).unwrap();
+
+    assert_stream_frame(
+        &mut pipe.server,
+        &fin_packet[..fin_packet_len],
+        stream_id,
+        body.len() as u64,
+        b"",
+        true,
+    );
+
+    let mut ack_packet = [0; 65535];
+    ack_client_packet(&mut pipe, body_packet_num, &mut ack_packet);
+
+    assert!(!pipe.client.streams.is_collected(stream_id));
+    assert!(pipe.client.streams.get(stream_id).is_some());
+    assert_eq!(pipe.client.streams.tx_buffered(), 0);
+    assert!(pipe.client.streams.tx_buffered_is_consistent());
+
+    test_utils::trigger_ack_based_loss(&mut pipe.client, &mut pipe.server);
+
+    let retransmit_packet_num = pipe.client.next_pkt_num;
+    let mut retransmit_packet = [0; 65535];
+    let (retransmit_packet_len, _) =
+        pipe.client.send(&mut retransmit_packet).unwrap();
+
+    assert_stream_frame(
+        &mut pipe.server,
+        &retransmit_packet[..retransmit_packet_len],
+        stream_id,
+        body.len() as u64,
+        b"",
+        true,
+    );
+
+    assert!(!pipe.client.streams.is_collected(stream_id));
+    assert_eq!(pipe.client.streams.tx_buffered(), 0);
+    assert!(pipe.client.streams.tx_buffered_is_consistent());
+
+    if ack_original_fin_after_retransmit {
+        assert_eq!(
+            pipe.server_recv(&mut fin_packet[..fin_packet_len]),
+            Ok(fin_packet_len)
+        );
+        ack_client_packet(&mut pipe, fin_packet_num, &mut ack_packet);
+
+        // Once the original packet is declared lost, its frame metadata is
+        // associated with the retransmission. A delayed ACK for the original
+        // packet is harmless, but conservatively leaves the stream retained.
+        assert!(!pipe.client.streams.is_collected(stream_id));
+    }
+
+    assert_eq!(
+        pipe.server_recv(&mut retransmit_packet[..retransmit_packet_len]),
+        Ok(retransmit_packet_len)
+    );
+    ack_client_packet(&mut pipe, retransmit_packet_num, &mut ack_packet);
+
+    assert!(pipe.client.streams.is_collected(stream_id));
+    assert_eq!(pipe.client.streams.tx_buffered(), 0);
+    assert!(pipe.client.streams.tx_buffered_is_consistent());
+}
+
+#[rstest]
 /// Tests that the stream's fin flag is properly flushed even if there's no
 /// data in the buffer, that the buffer becomes readable on the other
 /// side and stays readable even if the stream is fin'd locally.

@@ -122,6 +122,9 @@ where
     /// The final stream offset written to the stream, if any.
     fin_off: Option<u64>,
 
+    /// Whether a STREAM frame carrying FIN was acknowledged.
+    fin_acked: bool,
+
     /// Whether the stream's send-side has been shut down.
     shutdown: bool,
 
@@ -324,6 +327,13 @@ impl<F: BufFactory> SendBuf<F> {
         self.acked.insert(off..off + len as u64);
     }
 
+    /// Marks the STREAM frame carrying the final size as acknowledged.
+    pub(crate) fn ack_fin(&mut self, final_size: u64) {
+        if self.fin_off == Some(final_size) {
+            self.fin_acked = true;
+        }
+    }
+
     pub fn ack_and_drop(&mut self, off: u64, len: usize) -> usize {
         self.ack(off, len);
 
@@ -520,11 +530,17 @@ impl<F: BufFactory> SendBuf<F> {
 
     /// Returns true if the send-side of the stream is complete.
     ///
-    /// This happens when the stream's send final size is known, and the peer
-    /// has already acked all stream data up to that point.
+    /// This happens when the peer has acknowledged both the final size and all
+    /// stream data up to that point. A reset send buffer is also complete
+    /// because RESET_STREAM retransmission is tracked separately.
     pub fn is_complete(&self) -> bool {
         if let Some(fin_off) = self.fin_off {
-            if self.acked == (0..fin_off) {
+            // RESET_STREAM retransmission is tracked separately by StreamMap.
+            let final_size_tracked =
+                self.fin_acked || self.is_stopped() || self.is_shutdown();
+            let data_acked = fin_off == 0 || self.acked == (0..fin_off);
+
+            if final_size_tracked && data_acked {
                 return true;
             }
         }
@@ -821,6 +837,76 @@ mod tests {
         assert!(fin);
         assert_eq!(&buf[..written], b"something");
         assert_eq!(send.buffered_bytes, 0);
+
+        send.ack_and_drop(0, written);
+        assert!(!send.is_complete());
+
+        send.ack_fin(written as u64);
+        assert!(send.is_complete());
+    }
+
+    #[test]
+    fn complete_requires_separate_fin_ack() {
+        let mut buf = [0; 4];
+        let mut send = <SendBuf>::new(u64::MAX);
+
+        assert_eq!(send.write(b"body", false), Ok(4));
+        assert_eq!(send.emit(&mut buf), Ok((4, false)));
+
+        assert_eq!(send.write(b"", true), Ok(0));
+        assert_eq!(send.emit(&mut []), Ok((0, true)));
+
+        send.ack_and_drop(0, 4);
+        assert!(!send.is_complete());
+
+        send.ack_fin(3);
+        assert!(!send.is_complete());
+
+        send.ack_fin(4);
+        assert!(send.is_complete());
+    }
+
+    #[test]
+    fn complete_with_fin_ack_before_data_ack() {
+        let mut buf = [0; 4];
+        let mut send = <SendBuf>::new(u64::MAX);
+
+        assert_eq!(send.write(b"body", false), Ok(4));
+        assert_eq!(send.emit(&mut buf), Ok((4, false)));
+
+        assert_eq!(send.write(b"", true), Ok(0));
+        assert_eq!(send.emit(&mut []), Ok((0, true)));
+
+        send.ack_fin(4);
+        assert!(!send.is_complete());
+
+        send.ack_and_drop(0, 4);
+        assert!(send.is_complete());
+    }
+
+    #[test]
+    fn empty_stream_requires_fin_ack() {
+        let mut send = <SendBuf>::new(u64::MAX);
+
+        assert_eq!(send.write(b"", true), Ok(0));
+        assert_eq!(send.emit(&mut []), Ok((0, true)));
+        assert!(!send.is_complete());
+
+        send.ack_fin(0);
+        assert!(send.is_complete());
+    }
+
+    #[test]
+    fn reset_completion_does_not_require_fin_ack() {
+        let mut stopped = <SendBuf>::new(u64::MAX);
+        assert_eq!(stopped.write(b"body", true), Ok(4));
+        assert_eq!(stopped.stop(42), Ok((0, 4)));
+        assert!(stopped.is_complete());
+
+        let mut shutdown = <SendBuf>::new(u64::MAX);
+        assert_eq!(shutdown.write(b"body", true), Ok(4));
+        assert_eq!(shutdown.shutdown(), Ok((0, 4)));
+        assert!(shutdown.is_complete());
     }
 
     /// Check SendBuf::len calculation on a retransmit case
